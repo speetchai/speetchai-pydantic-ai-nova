@@ -6,5 +6,5 @@ This package provides integration between Amazon Bedrock's Nova model and pydant
 
 from .nova import AmazonNovaModel, AmazonNovaAgentModel, Usage
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["AmazonNovaModel", "AmazonNovaAgentModel", "Usage"] 
