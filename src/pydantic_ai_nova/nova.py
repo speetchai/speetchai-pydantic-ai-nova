@@ -18,12 +18,13 @@ Example:
 """
 
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional, List, Dict, Any
+from typing import AsyncIterator, Optional, List, Dict, Any, Union
 import boto3
 import json
 from pydantic_ai.models import Model, AgentModel, ModelResponse, ModelSettings
-from pydantic_ai.messages import TextPart, ToolCallPart
+from pydantic_ai.messages import TextPart, ToolCallPart, ModelMessage
 from pydantic_ai import Agent
+from pydantic_ai.tools import ToolDefinition
 
 @dataclass
 class Usage:
@@ -63,43 +64,66 @@ class AmazonNovaModel(Model):
     """
     model_id: str
     client: boto3.client = field(repr=False)
+    region_name: str
+    temperature: float
+    top_p: float
+    system_prompts: list[dict]  # Added system prompts
 
-    def __init__(self, model_id: str, region_name: str = 'us-east-1', **kwargs):
+    def __init__(
+        self,
+        model_id: str,
+        region_name: str = "us-east-1",
+        temperature: float = 1,
+        top_p: float = 1,
+        system_prompts: Optional[list[dict]] = None
+    ):
         """
         Initialize the Nova model.
         
         Args:
             model_id (str): The Nova model ID to use
             region_name (str, optional): AWS region name. Defaults to 'us-east-1'
-            **kwargs: Additional arguments passed to boto3.client
+            temperature (float, optional): Temperature for model inference. Defaults to 1
+            top_p (float, optional): Top P for model inference. Defaults to 1
+            system_prompts (Optional[list[dict]], optional): List of system prompts. Each prompt should be a dict with 'text' key.
         """
         self.model_id = model_id
-        self.client = boto3.client('bedrock-runtime', region_name=region_name, **kwargs)
+        self.region_name = region_name
+        self.temperature = temperature
+        self.top_p = top_p
+        self.system_prompts = system_prompts or []
+        self.client = boto3.client('bedrock-runtime', region_name=region_name)
 
     async def agent_model(
         self,
         *,
-        function_tools: List,
+        function_tools: list[ToolDefinition],
         allow_text_result: bool,
-        result_tools: List,
+        result_tools: list[ToolDefinition],
     ) -> AgentModel:
         """
         Create an agent model instance for function calling.
         
         Args:
-            function_tools (List): List of available function tools
+            function_tools (list[ToolDefinition]): List of available function tools
             allow_text_result (bool): Whether to allow text responses
-            result_tools (List): List of result processing tools
+            result_tools (list[ToolDefinition]): List of result processing tools
         
         Returns:
             AgentModel: An instance of AmazonNovaAgentModel
         """
-        tools = [self._map_tool_definition(tool) for tool in function_tools + result_tools]
+        tools = [self._map_tool_definition(r) for r in function_tools]
+        if result_tools:
+            tools += [self._map_tool_definition(r) for r in result_tools]
+
         return AmazonNovaAgentModel(
             client=self.client,
             model_id=self.model_id,
             allow_text_result=allow_text_result,
             tools=tools,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            system_prompts=self.system_prompts
         )
 
     def name(self) -> str:
@@ -107,12 +131,20 @@ class AmazonNovaModel(Model):
         return f'amazon_nova:{self.model_id}'
 
     @staticmethod
-    def _map_tool_definition(tool):
+    def _map_tool_definition(f: ToolDefinition) -> dict:
         """Map a pydantic-ai tool definition to Nova's format."""
         return {
-            'name': tool.name,
-            'description': tool.description,
-            'parameters': tool.parameters_json_schema,
+            "toolSpec": {
+                "name": f.name,
+                "description": f"**{f.description}**",  # Nova recommends using ** for emphasis
+                "inputSchema": {
+                    "json": {
+                        "type": "object",
+                        "properties": f.parameters_json_schema.get("properties", {}),
+                        "required": f.parameters_json_schema.get("required", []),
+                    }
+                }
+            }
         }
 
 @dataclass
@@ -127,218 +159,130 @@ class AmazonNovaAgentModel(AgentModel):
         client (boto3.client): Boto3 client for Bedrock runtime
         model_id (str): The Nova model ID
         allow_text_result (bool): Whether to allow text responses
-        tools (List): List of available tools
+        tools (list[dict]): List of available tools
+        temperature (float): Temperature for model inference
+        top_p (float): Top P for model inference
+        system_prompts (list[dict]): List of system prompts
     """
     client: boto3.client
     model_id: str
     allow_text_result: bool
-    tools: List
+    tools: list[dict]
+    temperature: float
+    top_p: float
+    system_prompts: list[dict]  # Added system prompts
+
+    def _prepare_messages(self, messages: list[ModelMessage]) -> list[dict]:
+        """Convert pydantic-ai messages to Nova format"""
+        nova_messages = []
+        
+        # Debug print
+        print("Input messages:", messages)
+        
+        for msg in messages:
+            if hasattr(msg, 'parts'):
+                for part in msg.parts:
+                    if hasattr(part, 'content'):  # Handle UserPromptPart
+                        nova_messages.append({
+                            "role": "user",
+                            "content": [{"text": part.content}]
+                        })
+                    elif isinstance(part, TextPart):
+                        nova_messages.append({
+                            "role": "user",
+                            "content": [{"text": part.content}]
+                        })
+                    elif isinstance(part, ToolCallPart):
+                        nova_messages.append({
+                            "role": "assistant",
+                            "content": [{
+                                "function_call": {
+                                    "name": part.tool_name,
+                                    "arguments": json.dumps(part.args)
+                                }
+                            }]
+                        })
+        
+        # Debug print
+        print("Prepared messages:", nova_messages)
+        
+        return nova_messages
 
     async def request(
-        self,
-        messages: List[Any],
-        model_settings: Optional[ModelSettings] = None,
-    ) -> (ModelResponse, Usage):
-        """
-        Send a request to the Nova model.
-        
-        Args:
-            messages (List[Any]): List of messages to send
-            model_settings (Optional[ModelSettings]): Model settings
-        
-        Returns:
-            Tuple[ModelResponse, Usage]: Model response and usage statistics
-        """
-        response = await self._invoke_model(messages, model_settings, stream=False)
-        return self._process_response(response), self._extract_usage(response)
-
-    async def request_stream(
-        self,
-        messages: List[Any],
-        model_settings: Optional[ModelSettings] = None,
-    ) -> AsyncIterator:
-        """
-        Send a streaming request to the Nova model.
-        
-        Args:
-            messages (List[Any]): List of messages to send
-            model_settings (Optional[ModelSettings]): Model settings
-        
-        Yields:
-            AsyncIterator: Stream of response chunks
-        """
-        response = await self._invoke_model(messages, model_settings, stream=True)
-        async for chunk in self._process_streamed_response(response):
-            yield chunk
-
-    def _extract_message_content(self, message: Any) -> str:
-        """
-        Extract content from various message formats.
-        
-        Args:
-            message (Any): Message to extract content from
-        
-        Returns:
-            str: Extracted message content
-        """
-        if hasattr(message, 'parts'):
-            for part in message.parts:
-                if hasattr(part, 'content'):
-                    return part.content
-        if hasattr(message, 'message'):
-            return message.message
-        if hasattr(message, 'text'):
-            return message.text
-        if hasattr(message, 'content'):
-            return message.content
-        return str(message)
-
-    async def _invoke_model(self, messages: List[Any], model_settings, stream: bool):
-        """
-        Invoke the Nova model with the given messages.
-        
-        Args:
-            messages (List[Any]): Messages to send
-            model_settings: Model settings
-            stream (bool): Whether to use streaming mode
-        
-        Returns:
-            Response from the Nova model
-        """
-        formatted_messages = []
-        for msg in messages:
-            content = self._extract_message_content(msg)
-            if content:
-                formatted_messages.append({
-                    "role": "user",
-                    "content": [{"text": content}]
-                })
-
-        # Ensure we have at least one message
-        if not formatted_messages:
-            formatted_messages.append({
-                "role": "user",
-                "content": [{"text": "Hello"}]
-            })
-
-        payload = {
-            "messages": formatted_messages
+        self, 
+        messages: list[ModelMessage], 
+        model_settings: Optional[ModelSettings]
+    ) -> tuple[ModelResponse, Usage]:
+        """Send a request to the Nova model"""
+        request_body = {
+            "messages": self._prepare_messages(messages),
+            "system": self.system_prompts
         }
-        
-        if model_settings and hasattr(model_settings, 'temperature'):
-            payload['temperature'] = model_settings.temperature
+
+        if self.tools:
+            request_body["toolConfig"] = {
+                "tools": self.tools
+            }
 
         try:
-            if stream:
-                response = self.client.invoke_model_with_response_stream(
-                    body=json.dumps(payload).encode('utf-8'),
-                    modelId=self.model_id
-                )
-                return response
-            else:
-                response = self.client.invoke_model(
-                    body=json.dumps(payload).encode('utf-8'),
-                    modelId=self.model_id
-                )
-                return json.loads(response['body'].read().decode('utf-8'))
+            response = await self._invoke_model(request_body)
+            return self._process_response(response), Usage()
         except Exception as e:
-            print(f"Error invoking model: {e}")
-            print(f"Payload was: {json.dumps(payload, indent=2)}")
+            print(f"Error in request: {e}")
             raise
 
-    @staticmethod
-    def _process_response(response: Dict[str, Any]) -> ModelResponse:
-        """
-        Process a response from the Nova model.
-        
-        Args:
-            response (Dict[str, Any]): Raw response from Nova
-        
-        Returns:
-            ModelResponse: Processed response
-        """
+    async def _invoke_model(self, request_body: dict) -> dict:
+        """Make the actual API call to Nova"""
+        try:
+            response = self.client.invoke_model(
+                body=json.dumps(request_body).encode('utf-8'),
+                modelId=self.model_id,
+                accept='application/json',
+                contentType='application/json'
+            )
+            return json.loads(response['body'].read().decode('utf-8'))
+        except Exception as e:
+            print(f"Error invoking model: {e}")
+            print(f"Request body was: {json.dumps(request_body, indent=2)}")
+            raise
+
+    def _process_response(self, response: dict) -> ModelResponse:
+        """Process Nova's response into pydantic-ai format"""
         parts = []
         
-        # Nova returns the response in output.message.content
+        # Debug print
+        print("Raw response:", response)
+        
         if 'output' in response:
-            message = response['output'].get('message', {})
-            if 'content' in message:
-                for content_part in message['content']:
-                    if 'text' in content_part:
-                        parts.append(TextPart(content=content_part['text']))
+            output = response['output']
+            if 'message' in output:
+                message = output['message']
+                if 'content' in message and message['content']:
+                    # Handle text response
+                    if 'text' in message['content'][0]:
+                        parts.append(TextPart(content=message['content'][0]['text']))
+                    
+                    # Handle function calls
+                    if 'tool_calls' in message:
+                        for tool_call in message['tool_calls']:
+                            parts.append(ToolCallPart.from_raw_args(
+                                tool_name=tool_call['function']['name'],
+                                args=json.loads(tool_call['function']['arguments']),
+                                id=tool_call.get('id', '')
+                            ))
+                    
+                    # Handle single function call
+                    if 'function_call' in message:
+                        parts.append(ToolCallPart.from_raw_args(
+                            tool_name=message['function_call']['name'],
+                            args=json.loads(message['function_call']['arguments']),
+                            id=message.get('id', '')
+                        ))
         
-        # Handle tool calls if present
-        if 'tool_calls' in response.get('output', {}).get('message', {}):
-            for tool_call in response['output']['message']['tool_calls']:
-                tool_name = tool_call.get('function', {}).get('name')
-                tool_args = tool_call.get('function', {}).get('arguments', '{}')
-                if isinstance(tool_args, str):
-                    tool_args = json.loads(tool_args)
-                parts.append(ToolCallPart.from_raw_args(
-                    tool_name=tool_name,
-                    args=tool_args,
-                    id=tool_call.get('id', '')
-                ))
-        
-        # Only add default response if we got no response from the model
+        # Only use default response if we got nothing from the model
         if not parts:
             print("Warning: No response from model, using default response")
-            print("Response was:", response)
+            print("Full response was:", response)
             parts.append(TextPart(content="I am an AI assistant. How can I help you?"))
         
-        return ModelResponse(
-            parts=parts,
-            timestamp=response.get("timestamp"),
-        )
-
-    @staticmethod
-    async def _process_streamed_response(response):
-        """
-        Process a streaming response from the Nova model.
-        
-        Args:
-            response: Raw streaming response from Nova
-        
-        Yields:
-            Response parts as they arrive
-        """
-        async for event in response['body']:
-            chunk = json.loads(event['chunk']['bytes'].decode('utf-8'))
-            # Handle Nova's output format
-            if 'output' in chunk:
-                message = chunk['output'].get('message', {})
-                if 'content' in message:
-                    for content_part in message['content']:
-                        if 'text' in content_part:
-                            yield TextPart(content=content_part['text'])
-                
-                # Handle tool calls
-                if 'tool_calls' in message:
-                    for tool_call in message['tool_calls']:
-                        tool_name = tool_call.get('function', {}).get('name')
-                        tool_args = tool_call.get('function', {}).get('arguments', '{}')
-                        if isinstance(tool_args, str):
-                            tool_args = json.loads(tool_args)
-                        yield ToolCallPart.from_raw_args(
-                            tool_name=tool_name,
-                            args=tool_args,
-                            id=tool_call.get('id', '')
-                        )
-
-    @staticmethod
-    def _extract_usage(response: Dict[str, Any]) -> Usage:
-        """
-        Extract usage statistics from a Nova response.
-        
-        Args:
-            response (Dict[str, Any]): Raw response from Nova
-        
-        Returns:
-            Usage: Usage statistics
-        """
-        usage_data = response.get("usage", {})
-        return Usage(
-            request_tokens=usage_data.get("request_tokens", 0),
-            response_tokens=usage_data.get("response_tokens", 0),
-            total_tokens=usage_data.get("total_tokens", 0),
-        ) 
+        return ModelResponse(parts=parts) 

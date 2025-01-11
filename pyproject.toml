@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pydantic-ai-nova"
-version = "0.1.1"
+version = "0.2.0"
 authors = [
   { name="Bilal Ahmed", email="ba@speetch.ai" },
 ]
@@ -17,10 +17,16 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pydantic-ai>=0.0.18",
+    "pydantic-ai==0.0.18",
     "boto3>=1.28.0",
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/speetchai/speetchai-pydantic-ai-nova"
 "Bug Tracker" = "https://github.com/speetchai/speetchai-pydantic-ai-nova/issues" 
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+] 
